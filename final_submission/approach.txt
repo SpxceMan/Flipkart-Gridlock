@@ -1,0 +1,97 @@
+========================================
+PROJECT OVERVIEW
+========================================
+
+- Problem statement: Predict demand accurately based on spatiotemporal features like geohash, weather, timestamp, and road type data in a regression hackathon format.
+- Objective: Maximize prediction accuracy.
+- Evaluation metric (R²): score = max(0, 100 * R²)
+
+========================================
+DATA PREPROCESSING
+========================================
+
+- Missing value handling:
+  - Numeric (Temperature): Median fill
+  - Categorical (Weather, RoadType): Mode fill with a dedicated 'missing' indicator column
+- Duplicate handling:
+  - Checked for duplicate rows (none found in training data).
+- Data type conversions:
+  - Converted timestamps from string to separate hour and minute integer columns.
+- Timestamp processing:
+  - Parsed strings in "HH:MM" format.
+  - Extracted hours and minutes.
+  - Created 15-minute time slots (0-95 indices).
+  - Derived dayofweek, dayofmonth, weekofyear, month, quarter, is_weekend, is_month_start, is_month_end from the 'day' column.
+
+========================================
+FEATURE ENGINEERING
+========================================
+
+- Timestamp features: hour, minute, time_slot, dayofweek, dayofmonth, weekofyear, month, quarter, is_weekend, is_month_start, is_month_end
+- Cyclical features: sin_hour, cos_hour, sin_minute, cos_minute, sin_dayofweek, cos_dayofweek, sin_month, cos_month, sin_time_slot, cos_time_slot
+- Geohash decoding: Parsed geohash into continuous latitude and longitude using custom base32 decoding.
+- Latitude/Longitude features: lat_lon_interaction, lat_squared, lon_squared, lat_plus_lon, lat_minus_lon, geohash prefixes (length 3, 4, 5).
+- KMeans cluster features: KMeans clustering applied on lat/lon coordinates with k=5, 10, 20, 50.
+- Frequency encoding: Normalized value counts for RoadType, Weather, geohash, geohash prefixes.
+- Target encoding: Out-of-fold target encoding with 5 folds on categorical and interaction features (RoadType_le, Weather_le, geohash_le, geohash_prefix4_le, geo_cluster_10, geo_cluster_20, RoadType_Weather, Hour_RoadType, Hour_Weather, TimeSlot_RoadType) to prevent leakage.
+- Aggregation features: 
+  - Mean, median, std, min, max target demand for geohash, geohash prefixes, hour, time_slot.
+  - Temperature aggregations (count, mean, median, std) for geohash, RoadType, Weather.
+  - Geohash interaction target aggregations (geohash x hour, geohash x RoadType).
+  - Historical demand statistics derived from Day 48 data mapped to Day 49 test set.
+- Interaction features: RoadType_Weather, RoadType_Lanes, Weather_Temp, LargeVeh_Lanes, Landmarks_RoadType, Hour_RoadType, Hour_Weather, Lanes_Landmarks, Hour_Lanes, TimeSlot_RoadType, demand_ratio_gh_hour, demand_ratio_ts_hour.
+
+========================================
+MODELS TRAINED
+========================================
+
+- LightGBM
+  - Validation score: R² = 0.993523
+  - Important hyperparameters: Dynamically tuned via 100 Optuna trials (approximate parameters: learning_rate~0.05, num_leaves~127)
+
+- XGBoost
+  - Validation score: R² = 0.993157
+  - Important hyperparameters: max_depth=10, learning_rate=0.0538, subsample=0.74, colsample_bytree=0.88, colsample_bylevel=0.49, min_child_weight=34
+
+- CatBoost
+  - Validation score: R² = 0.995510
+  - Important hyperparameters: bootstrap_type='MVS', learning_rate=0.0292, depth=6, l2_leaf_reg=0.564, colsample_bylevel=0.413, min_data_in_leaf=47, random_strength=0.718, subsample=0.684
+
+- ExtraTrees
+  - Validation score: R² = 0.995212
+  - Important hyperparameters: n_estimators=200, max_depth=12, min_samples_split=10, min_samples_leaf=4, max_features=0.7
+
+- RandomForest
+  - Validation score: R² = 0.995489
+  - Important hyperparameters: n_estimators=200, max_depth=12, min_samples_split=10, min_samples_leaf=4, max_features=0.7
+
+========================================
+ENSEMBLE STRATEGY
+========================================
+
+LightGBM: 0.0000
+XGBoost: 0.0000
+CatBoost: 0.4763
+ExtraTrees: 0.1332
+RandomForest: 0.3905
+
+========================================
+RESULTS
+========================================
+
+- Best CV score: 0.995510 (CatBoost single model)
+- Final ensemble score: 0.996021
+- Top important features:
+  1. RoadType_le
+  2. geohash_ts_day48_demand_mean
+  3. geohash_road_demand_mean
+  4. RoadType_Weather
+  5. geohash_hour_demand_mean
+
+========================================
+FILES INCLUDED
+========================================
+
+submission.csv
+solution.py
+approach.txt
