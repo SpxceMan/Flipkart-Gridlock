@@ -330,31 +330,145 @@ for k in [5, 10, 20, 50]:
 # Temperature bins
 df['temp_bin'] = pd.cut(df['Temperature'], bins=10, labels=False)
 
-# Demand lag-like features: for same geohash at previous time slots (from day 48 TRAINING data)
-# Since test is day 49, we use day 48 geohash-level stats as "history".
-# IMPORTANT: only use day 48 rows that are in the training fold (not in the
-# temporal validation window) so the feature is leakage-free.
-day48_train_mask = (
-    (df['_is_train'] == 1)
-    & (df['day'] == 48)
-    & (~df['timestamp'].isin(TEST_TS_SET))
-)
-gh_day48_stats = df.loc[day48_train_mask].groupby('geohash')[target_col].agg(['mean', 'std', 'min', 'max', 'count'])
-gh_day48_stats.columns = [f'geohash_day48_demand_{s}' for s in ['mean', 'std', 'min', 'max', 'count']]
-gh_day48_stats = gh_day48_stats.reset_index()
-for col in gh_day48_stats.columns:
-    if col != 'geohash' and col in df.columns:
-        df.drop(col, axis=1, inplace=True)
-df = df.merge(gh_day48_stats, on='geohash', how='left')
+# ── 3h-i. Day-level lag features (temporal-isolation aware) ──────────────────
+# Core insight: (geohash, timestamp) is the dominant predictive unit.
+# We need "what happened here, at this exact time, yesterday" as a direct signal.
+#
+# Temporal isolation:
+#   - Val rows  (day 48, test-window timestamps) → lag from day 47
+#   - Test rows (day 49)                         → lag from day 48 (full)
+#   - Other train rows (day d)                   → lag from day d-1
+#
+# The old geohash_ts_day48 feature was broken: it only used non-test-window
+# hours from day 48 (night/evening), giving wrong signal for morning test window.
+print("Building day-level lag features...")
 
-# Per-timeslot on day 48 for each geohash (training fold only)
-gh_ts_day48 = df.loc[day48_train_mask].groupby(['geohash', 'time_slot'])[target_col].agg(['mean'])
-gh_ts_day48.columns = ['geohash_ts_day48_demand_mean']
-gh_ts_day48 = gh_ts_day48.reset_index()
-for col in gh_ts_day48.columns:
-    if col not in ['geohash', 'time_slot'] and col in df.columns:
-        df.drop(col, axis=1, inplace=True)
-df = df.merge(gh_ts_day48, on=['geohash', 'time_slot'], how='left')
+# -- Build per-day lookup dictionaries for (geohash, timestamp) → demand --
+# We use the ORIGINAL train DataFrame (before concat with test) to avoid any
+# accidental leakage from test rows.
+_train_for_lags = df.loc[df['_is_train'] == 1].copy()
+_lag_dicts = {}  # day → {(geohash, timestamp): demand_mean}
+for d in _train_for_lags['day'].unique():
+    day_data = _train_for_lags[_train_for_lags['day'] == d]
+    _lag_dicts[int(d)] = day_data.groupby(['geohash', 'timestamp'])[target_col].mean().to_dict()
+
+# Also build per-day (geohash, hour) → demand for coarser fallback
+_lag_hour_dicts = {}
+for d in _train_for_lags['day'].unique():
+    day_data = _train_for_lags[_train_for_lags['day'] == d]
+    _lag_hour_dicts[int(d)] = day_data.groupby(['geohash', 'hour'])[target_col].mean().to_dict()
+
+# Per-day geohash-level aggregates (fallback when exact timestamp unseen)
+_lag_geo_dicts = {}
+for d in _train_for_lags['day'].unique():
+    day_data = _train_for_lags[_train_for_lags['day'] == d]
+    _lag_geo_dicts[int(d)] = day_data.groupby('geohash')[target_col].mean().to_dict()
+
+# Global mean for ultimate fallback
+_global_demand_mean = _train_for_lags[target_col].mean()
+
+# -- Compute lag day for each row --
+# Val rows: day 48 with test-window timestamps → lag day 47
+# Test rows: day 49 → lag day 48
+# Other train rows: day d → lag day d-1
+is_val_row = (df['_is_train'] == 1) & (df['day'] == 48) & (df['timestamp'].isin(TEST_TS_SET))
+is_test_row = (df['_is_train'] == 0)
+
+lag_day = (df['day'] - 1).astype(int).values.copy()
+# Val rows explicitly get day 47
+lag_day[is_val_row.values] = 47
+# Test rows explicitly get day 48
+lag_day[is_test_row.values] = 48
+
+# -- Vectorized lag lookup --
+geohashes = df['geohash'].values
+timestamps = df['timestamp'].values
+hours = df['hour'].values
+
+# demand_lag1: exact (geohash, timestamp) match from previous day
+demand_lag1 = np.full(len(df), np.nan)
+# demand_lag1_hour: (geohash, hour) match from previous day (coarser)
+demand_lag1_hour = np.full(len(df), np.nan)
+# demand_lag1_geo: geohash-level mean from previous day
+demand_lag1_geo = np.full(len(df), np.nan)
+
+for i in range(len(df)):
+    ld = lag_day[i]
+    gh = geohashes[i]
+    ts = timestamps[i]
+    hr = hours[i]
+    
+    # Exact (geohash, timestamp) lag
+    if ld in _lag_dicts:
+        demand_lag1[i] = _lag_dicts[ld].get((gh, ts), np.nan)
+    
+    # (geohash, hour) lag
+    if ld in _lag_hour_dicts:
+        demand_lag1_hour[i] = _lag_hour_dicts[ld].get((gh, hr), np.nan)
+    
+    # geohash-level lag
+    if ld in _lag_geo_dicts:
+        demand_lag1_geo[i] = _lag_geo_dicts[ld].get(gh, np.nan)
+
+df['demand_lag1'] = demand_lag1
+df['demand_lag1_hour'] = demand_lag1_hour
+df['demand_lag1_geo'] = demand_lag1_geo
+
+# -- Bayesian smoothed lag (handles sparse coverage) --
+# For (geohash, timestamp) lags: smooth toward geohash mean with prior strength M
+# smoothed = (sum + M * prior) / (count + M)
+# We compute count and sum per (geohash, timestamp) per lag-day
+SMOOTH_M = 10  # prior strength
+
+# Build sum and count dicts per day
+_lag_sum_dicts = {}
+_lag_count_dicts = {}
+for d in _train_for_lags['day'].unique():
+    day_data = _train_for_lags[_train_for_lags['day'] == d]
+    _lag_sum_dicts[int(d)] = day_data.groupby(['geohash', 'timestamp'])[target_col].sum().to_dict()
+    _lag_count_dicts[int(d)] = day_data.groupby(['geohash', 'timestamp'])[target_col].count().to_dict()
+
+lag_sum = np.zeros(len(df))
+lag_count = np.zeros(len(df))
+lag_prior = np.full(len(df), _global_demand_mean)
+
+for i in range(len(df)):
+    ld = lag_day[i]
+    gh = geohashes[i]
+    ts = timestamps[i]
+    
+    if ld in _lag_sum_dicts:
+        lag_sum[i] = _lag_sum_dicts[ld].get((gh, ts), 0.0)
+        lag_count[i] = _lag_count_dicts[ld].get((gh, ts), 0.0)
+    
+    # Use geohash-level lag as the prior (better than global mean)
+    if not np.isnan(demand_lag1_geo[i]):
+        lag_prior[i] = demand_lag1_geo[i]
+
+df['demand_lag1_smooth'] = (lag_sum + SMOOTH_M * lag_prior) / (lag_count + SMOOTH_M)
+
+# -- Coverage indicator: does this row have an exact lag? --
+df['demand_lag1_available'] = (~np.isnan(demand_lag1)).astype(int)
+
+# -- Cascading fallback for demand_lag1 --
+# Fill NaN with: hour-level lag → geo-level lag → overall geohash mean
+df['demand_lag1'] = df['demand_lag1'].fillna(df['demand_lag1_hour'])
+df['demand_lag1'] = df['demand_lag1'].fillna(df['demand_lag1_geo'])
+df['demand_lag1'] = df['demand_lag1'].fillna(df['geohash_demand_mean'])
+df['demand_lag1'] = df['demand_lag1'].fillna(_global_demand_mean)
+
+df['demand_lag1_hour'] = df['demand_lag1_hour'].fillna(df['demand_lag1_geo'])
+df['demand_lag1_hour'] = df['demand_lag1_hour'].fillna(_global_demand_mean)
+df['demand_lag1_geo'] = df['demand_lag1_geo'].fillna(_global_demand_mean)
+
+# -- Delta: how much does the lag deviate from the geohash average? --
+df['demand_lag1_delta'] = df['demand_lag1'] - df['geohash_demand_mean'].fillna(_global_demand_mean)
+
+lag1_coverage = df.loc[df['_is_train'] == 0, 'demand_lag1_available'].mean()
+lag1_val_coverage = df.loc[is_val_row, 'demand_lag1_available'].mean()
+print(f"  Lag1 coverage — test: {lag1_coverage:.1%}, val: {lag1_val_coverage:.1%}")
+print(f"  New lag features: demand_lag1, demand_lag1_hour, demand_lag1_geo, "
+      f"demand_lag1_smooth, demand_lag1_available, demand_lag1_delta")
 
 # Ratio features
 df['demand_ratio_gh_hour'] = df['geohash_hour_demand_mean'] / (df['geohash_demand_mean'] + 1e-8)
