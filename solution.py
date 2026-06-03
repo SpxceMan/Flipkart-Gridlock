@@ -263,6 +263,10 @@ for c in ['RoadType', 'Weather']:
 # ── 3g. Aggregation features ──
 print("Creating aggregation features...")
 train_mask = df['_is_train'] == 1
+# Fold-strict mask: excludes val rows (day 48 × test-window timestamps).
+# All demand aggregations must use this so the val signal is never seen
+# during feature construction, making local scores honest.
+_train_fold_mask = train_mask & ~((df['day'] == 48) & (df['timestamp'].isin(TEST_TS_SET)))
 
 agg_groups = ['geohash', 'RoadType', 'Weather', 'geohash_prefix4']
 for grp in agg_groups:
@@ -277,7 +281,7 @@ for grp in agg_groups:
             df.drop(col, axis=1, inplace=True)
     df = df.merge(train_agg, on=grp, how='left')
 
-# Geohash demand aggregations (only from train, for train-known geohashes)
+# Geohash demand aggregations (full train — maximises signal for stable features)
 for grp in ['geohash', 'geohash_prefix4', 'geohash_prefix3']:
     grp_demand = df.loc[train_mask].groupby(grp)[target_col].agg(['mean', 'median', 'std', 'min', 'max'])
     grp_demand.columns = [f'{grp}_demand_{s}' for s in ['mean', 'median', 'std', 'min', 'max']]
@@ -314,6 +318,64 @@ for col in gh_road.columns:
     if col not in ['geohash', 'RoadType_le'] and col in df.columns:
         df.drop(col, axis=1, inplace=True)
 df = df.merge(gh_road, on=['geohash', 'RoadType_le'], how='left')
+
+# ── Geohash × exact timestamp mean — two-pass, no leakage ─────────────────────
+# Pass 1 (fold-only reference): train and val rows see statistics computed from
+#   _train_fold_mask only, so val rows never see their own demand.
+# Pass 2 (full-train reference): test rows get the richer full-train estimate,
+#   matching John's build_features(test, train) discipline.
+print("Creating geohash × exact-timestamp features (two-pass)...")
+_global_ts_mean = df.loc[_train_fold_mask, target_col].mean()
+_global_ts_mean_full = df.loc[train_mask, target_col].mean()
+_test_row_mask = df['_is_train'] == 0
+
+# ── geohash_ts_demand_mean ──
+# Pass 1: fold-only stats → applied to all rows
+gh_ts_fold = df.loc[_train_fold_mask].groupby(['geohash', 'timestamp'])[target_col].mean()
+gh_ts_fold.name = 'geohash_ts_demand_mean'
+df = df.join(gh_ts_fold, on=['geohash', 'timestamp'], how='left')
+df['geohash_ts_demand_mean'] = df['geohash_ts_demand_mean'].fillna(df['geohash_demand_mean'])
+
+# Pass 2: full-train stats → override test rows only
+gh_ts_full = df.loc[train_mask].groupby(['geohash', 'timestamp'])[target_col].mean()
+gh_ts_full.name = 'geohash_ts_demand_mean_full'
+df = df.join(gh_ts_full, on=['geohash', 'timestamp'], how='left')
+df.loc[_test_row_mask, 'geohash_ts_demand_mean'] = \
+    df.loc[_test_row_mask, 'geohash_ts_demand_mean_full']
+df.loc[_test_row_mask, 'geohash_ts_demand_mean'] = \
+    df.loc[_test_row_mask, 'geohash_ts_demand_mean'].fillna(
+        df.loc[_test_row_mask, 'geohash_demand_mean'])
+df.drop(columns=['geohash_ts_demand_mean_full'], inplace=True)
+
+# ── geohash_ts_smooth (Bayesian, M=10) ──
+# Pass 1: fold-only counts/sums
+gh_ts_cnt_fold = df.loc[_train_fold_mask].groupby(['geohash', 'timestamp'])[target_col].count()
+gh_ts_sum_fold = df.loc[_train_fold_mask].groupby(['geohash', 'timestamp'])[target_col].sum()
+_idx = df.set_index(['geohash', 'timestamp']).index
+df['geohash_ts_smooth'] = (
+    gh_ts_sum_fold.reindex(_idx).values + _global_ts_mean * 10
+) / (
+    gh_ts_cnt_fold.reindex(_idx).values + 10
+)
+df['geohash_ts_smooth'] = df['geohash_ts_smooth'].fillna(df['geohash_demand_mean'])
+
+# Pass 2: full-train counts/sums → override test rows only
+gh_ts_cnt_full = df.loc[train_mask].groupby(['geohash', 'timestamp'])[target_col].count()
+gh_ts_sum_full = df.loc[train_mask].groupby(['geohash', 'timestamp'])[target_col].sum()
+_smooth_full = (
+    gh_ts_sum_full.reindex(_idx).values + _global_ts_mean_full * 10
+) / (
+    gh_ts_cnt_full.reindex(_idx).values + 10
+)
+df['_geohash_ts_smooth_full'] = _smooth_full
+df.loc[_test_row_mask, 'geohash_ts_smooth'] = df.loc[_test_row_mask, '_geohash_ts_smooth_full']
+df.loc[_test_row_mask, 'geohash_ts_smooth'] = \
+    df.loc[_test_row_mask, 'geohash_ts_smooth'].fillna(
+        df.loc[_test_row_mask, 'geohash_demand_mean'])
+df.drop(columns=['_geohash_ts_smooth_full'], inplace=True)
+
+print(f"  geohash_ts_demand_mean NaN rate: {df['geohash_ts_demand_mean'].isna().mean():.2%}")
+print(f"  geohash_ts_smooth      NaN rate: {df['geohash_ts_smooth'].isna().mean():.2%}")
 
 # Cluster demand aggregations
 for k in [5, 10, 20, 50]:
@@ -1028,19 +1090,25 @@ final_preds = np.clip(final_preds, 0, 1)
 # Also train on full data and predict
 print("\n--- Full-data retraining ---")
 
+# Round counts: CV best_iteration × 1.1  (avoids 94x overfit from flat 5000)
+lgb_best_iter  = int(lgb_t_models[0].best_iteration * 1.1)
+xgb_best_iter  = int(xgb_t_models[0].model.best_iteration * 1.1)
+cb_best_iter   = int(cb_t_models[0].best_iteration_ * 1.1)
+print(f"  Full-retrain rounds — LGB: {lgb_best_iter}, XGB: {xgb_best_iter}, CB: {cb_best_iter}")
+
 # LightGBM full
 dtrain_full = lgb.Dataset(X_train_sel, y)
-lgb_full = lgb.train(best_lgb_params, dtrain_full, num_boost_round=5000)
+lgb_full = lgb.train(best_lgb_params, dtrain_full, num_boost_round=lgb_best_iter)
 lgb_full_preds = lgb_full.predict(X_test_sel)
 
 # XGBoost full
 dtrain_full_xgb = xgb.DMatrix(X_train_sel, y)
-xgb_full = xgb.train(best_xgb_params, dtrain_full_xgb, num_boost_round=5000)
+xgb_full = xgb.train(best_xgb_params, dtrain_full_xgb, num_boost_round=xgb_best_iter)
 xgb_full_preds = xgb_full.predict(xgb.DMatrix(X_test_sel))
 
 # CatBoost full
 cb_full = cb.CatBoostRegressor(**{k: v for k, v in best_cb_params.items() if k != 'early_stopping_rounds'})
-cb_full.set_params(iterations=5000)
+cb_full.set_params(iterations=cb_best_iter)
 cb_full.fit(X_train_sel, y, verbose=0)
 cb_full_preds = cb_full.predict(X_test_sel)
 
